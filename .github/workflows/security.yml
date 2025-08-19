@@ -1,0 +1,175 @@
+name: PHP SDK Security Scan
+
+on:
+  schedule:
+    # Run daily at 2 AM UTC
+    - cron: '0 2 * * *'
+  push:
+    branches: [ main, develop ]
+    paths:
+      - 'sdk/php/composer.json'
+      - 'sdk/php/composer.lock'
+  workflow_dispatch:
+
+defaults:
+  run:
+    working-directory: sdk/php
+
+jobs:
+  security-scan:
+    name: Security Vulnerability Scan
+    runs-on: [self-hosted, linux, arm64, docker]
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.2'
+          extensions: sockets, json, mbstring
+          tools: composer:v2
+      
+      - name: Install dependencies
+        run: composer install --prefer-dist --no-progress --no-interaction
+      
+      - name: Run Composer Audit
+        run: |
+          echo "Checking for known security vulnerabilities in dependencies..."
+          composer audit --format=json > audit-report.json || true
+          
+          # Parse and display results
+          if [ -f audit-report.json ]; then
+            jq '.' audit-report.json
+            
+            # Check for vulnerabilities
+            VULN_COUNT=$(jq '.advisories | length' audit-report.json)
+            if [ "$VULN_COUNT" -gt 0 ]; then
+              echo "Found $VULN_COUNT security vulnerabilities!"
+              exit 1
+            else
+              echo "No security vulnerabilities found."
+            fi
+          fi
+      
+      - name: Run PHP Security Checker
+        run: |
+          # Install security checker
+          wget https://github.com/fabpot/local-php-security-checker/releases/download/v2.0.6/local-php-security-checker_2.0.6_linux_arm64 -O security-checker
+          chmod +x security-checker
+          
+          # Run security check
+          ./security-checker --format=json > security-report.json || true
+          
+          # Display results
+          if [ -f security-report.json ]; then
+            cat security-report.json | jq '.'
+            
+            # Check for vulnerabilities
+            if [ -s security-report.json ] && [ "$(cat security-report.json)" != "{}" ]; then
+              echo "Security vulnerabilities found!"
+              exit 1
+            else
+              echo "No security vulnerabilities found."
+            fi
+          fi
+      
+      - name: Check for outdated dependencies
+        run: |
+          echo "Checking for outdated dependencies..."
+          composer outdated --direct --format=json > outdated.json || true
+          
+          if [ -f outdated.json ]; then
+            jq '.' outdated.json
+            
+            # Count major version updates available
+            MAJOR_UPDATES=$(jq '[.installed[] | select(.latest | split(".")[0] != .version | split(".")[0])] | length' outdated.json)
+            if [ "$MAJOR_UPDATES" -gt 0 ]; then
+              echo "Warning: $MAJOR_UPDATES packages have major version updates available."
+            fi
+          fi
+      
+      - name: Static Security Analysis
+        run: |
+          # Install Psalm with security analysis plugin
+          composer require --dev vimeo/psalm psalm/plugin-phpunit -W
+          
+          # Create psalm.xml if it doesn't exist
+          if [ ! -f psalm.xml ]; then
+            cat > psalm.xml << 'EOF'
+          <?xml version="1.0"?>
+          <psalm
+              errorLevel="3"
+              resolveFromConfigFile="true"
+              xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+              xmlns="https://getpsalm.org/schema/config"
+              xsi:schemaLocation="https://getpsalm.org/schema/config vendor/vimeo/psalm/config.xsd"
+          >
+              <projectFiles>
+                  <directory name="src" />
+                  <ignoreFiles>
+                      <directory name="vendor" />
+                  </ignoreFiles>
+              </projectFiles>
+              
+              <issueHandlers>
+                  <TaintedInput errorLevel="error" />
+                  <TaintedHtml errorLevel="error" />
+                  <TaintedSql errorLevel="error" />
+                  <TaintedShell errorLevel="error" />
+                  <TaintedFile errorLevel="error" />
+                  <TaintedHeader errorLevel="error" />
+              </issueHandlers>
+          </psalm>
+          EOF
+          fi
+          
+          # Run Psalm security analysis
+          vendor/bin/psalm --taint-analysis --report=security-psalm.json || true
+          
+          if [ -f security-psalm.json ]; then
+            jq '.' security-psalm.json
+          fi
+      
+      - name: Upload security reports
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: security-reports
+          path: |
+            sdk/php/audit-report.json
+            sdk/php/security-report.json
+            sdk/php/outdated.json
+            sdk/php/security-psalm.json
+          retention-days: 30
+      
+      - name: Create security issue if vulnerabilities found
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const title = 'Security vulnerabilities detected in PHP SDK';
+            const body = `Security scan has detected vulnerabilities in the PHP SDK dependencies.
+            
+            Please review the security reports in the workflow artifacts and take appropriate action.
+            
+            Workflow run: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            
+            // Check if issue already exists
+            const issues = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              labels: 'security,php-sdk',
+              state: 'open'
+            });
+            
+            if (issues.data.length === 0) {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: title,
+                body: body,
+                labels: ['security', 'php-sdk', 'high-priority']
+              });
+            }

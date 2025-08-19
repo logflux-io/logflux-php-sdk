@@ -1,0 +1,238 @@
+name: PHP SDK CI
+
+on:
+  push:
+    branches: [ main, develop ]
+    paths:
+      - 'sdk/php/**'
+      - '.github/workflows/ci.yml'
+  pull_request:
+    branches: [ main, develop ]
+    paths:
+      - 'sdk/php/**'
+      - '.github/workflows/ci.yml'
+  workflow_dispatch:
+
+defaults:
+  run:
+    working-directory: sdk/php
+
+jobs:
+  test:
+    name: Test PHP ${{ matrix.php-version }}
+    runs-on: [self-hosted, linux, arm64, docker]
+    strategy:
+      fail-fast: false
+      matrix:
+        php-version: ['7.4', '8.0', '8.1', '8.2', '8.3']
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php-version }}
+          extensions: sockets, json, mbstring
+          coverage: xdebug
+          tools: composer:v2
+      
+      - name: Get composer cache directory
+        id: composer-cache
+        run: echo "dir=$(composer config cache-files-dir)" >> $GITHUB_OUTPUT
+      
+      - name: Cache dependencies
+        uses: actions/cache@v3
+        with:
+          path: ${{ steps.composer-cache.outputs.dir }}
+          key: ${{ runner.os }}-composer-${{ hashFiles('**/composer.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-composer-
+      
+      - name: Validate composer.json and composer.lock
+        run: composer validate --strict
+      
+      - name: Install dependencies
+        run: composer install --no-progress --prefer-dist --optimize-autoloader
+      
+      - name: Run PHPUnit tests
+        run: vendor/bin/phpunit --testdox
+      
+      - name: Generate test coverage report
+        if: matrix.php-version == '8.2'
+        run: vendor/bin/phpunit --coverage-clover coverage.xml
+      
+      - name: Upload coverage to Codecov
+        if: matrix.php-version == '8.2'
+        uses: codecov/codecov-action@v3
+        with:
+          file: ./sdk/php/coverage.xml
+          flags: php-sdk
+          fail_ci_if_error: false
+
+  static-analysis:
+    name: Static Analysis
+    runs-on: [self-hosted, linux, arm64, docker]
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.2'
+          extensions: sockets, json, mbstring
+          tools: composer:v2
+      
+      - name: Get composer cache directory
+        id: composer-cache
+        run: echo "dir=$(composer config cache-files-dir)" >> $GITHUB_OUTPUT
+      
+      - name: Cache dependencies
+        uses: actions/cache@v3
+        with:
+          path: ${{ steps.composer-cache.outputs.dir }}
+          key: ${{ runner.os }}-composer-${{ hashFiles('**/composer.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-composer-
+      
+      - name: Install dependencies
+        run: composer install --no-progress --prefer-dist --optimize-autoloader
+      
+      - name: Run PHPStan
+        run: vendor/bin/phpstan analyse src tests --level=8
+      
+      - name: Check code style with PHP_CodeSniffer
+        run: vendor/bin/phpcs --standard=PSR12 src tests
+
+  build:
+    name: Build and Package
+    runs-on: [self-hosted, linux, arm64, docker]
+    needs: [test, static-analysis]
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.2'
+          extensions: sockets, json, mbstring
+          tools: composer:v2
+      
+      - name: Install production dependencies
+        run: composer install --no-dev --no-progress --prefer-dist --optimize-autoloader
+      
+      - name: Create distribution package
+        run: |
+          mkdir -p dist
+          tar czf dist/logflux-agent-php-sdk.tar.gz \
+            --exclude=dist \
+            --exclude=tests \
+            --exclude=phpunit.xml.dist \
+            --exclude=.github \
+            --exclude=.gitignore \
+            .
+      
+      - name: Create Composer package
+        run: |
+          composer archive --format=zip --file=dist/logflux-agent-php-sdk
+      
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: php-sdk-dist
+          path: |
+            sdk/php/dist/*.tar.gz
+            sdk/php/dist/*.zip
+          retention-days: 30
+
+  integration-test:
+    name: Integration Tests
+    runs-on: [self-hosted, linux, arm64, docker]
+    needs: [test]
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.2'
+          extensions: sockets, json, mbstring
+          tools: composer:v2
+      
+      - name: Get composer cache directory
+        id: composer-cache
+        run: echo "dir=$(composer config cache-files-dir)" >> $GITHUB_OUTPUT
+      
+      - name: Cache dependencies
+        uses: actions/cache@v3
+        with:
+          path: ${{ steps.composer-cache.outputs.dir }}
+          key: ${{ runner.os }}-composer-${{ hashFiles('**/composer.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-composer-
+      
+      - name: Install dependencies
+        run: composer install --no-progress --prefer-dist --optimize-autoloader
+      
+      - name: Start mock LogFlux Agent server
+        run: |
+          # Create a simple mock server for testing
+          php -S 127.0.0.1:8090 -t . &
+          echo $! > /tmp/mock-server.pid
+          sleep 2
+      
+      - name: Run integration tests
+        run: |
+          php examples/basic.php
+      
+      - name: Stop mock server
+        if: always()
+        run: |
+          if [ -f /tmp/mock-server.pid ]; then
+            kill $(cat /tmp/mock-server.pid) || true
+            rm /tmp/mock-server.pid
+          fi
+
+  security-scan:
+    name: Security Scan
+    runs-on: [self-hosted, linux, arm64, docker]
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.2'
+          tools: composer:v2
+      
+      - name: Get composer cache directory
+        id: composer-cache
+        run: echo "dir=$(composer config cache-files-dir)" >> $GITHUB_OUTPUT
+      
+      - name: Cache dependencies
+        uses: actions/cache@v3
+        with:
+          path: ${{ steps.composer-cache.outputs.dir }}
+          key: ${{ runner.os }}-composer-${{ hashFiles('**/composer.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-composer-
+      
+      - name: Install dependencies
+        run: composer install --no-progress --prefer-dist --optimize-autoloader
+      
+      - name: Security check for known vulnerabilities
+        run: |
+          composer audit
+      
+      - name: Check for dependency updates
+        run: |
+          composer outdated --direct

@@ -1,0 +1,240 @@
+name: PHP SDK Release
+
+on:
+  push:
+    tags:
+      - 'php-sdk-v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release (e.g., 1.2.0)'
+        required: true
+        type: string
+
+defaults:
+  run:
+    working-directory: sdk/php
+
+jobs:
+  validate-version:
+    name: Validate Version
+    runs-on: [self-hosted, linux, arm64, docker]
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Determine version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ github.event.inputs.version }}"
+          else
+            VERSION="${GITHUB_REF#refs/tags/php-sdk-v}"
+          fi
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+      
+      - name: Validate version format
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          if ! echo "$VERSION" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9]+)?$'; then
+            echo "Invalid version format: $VERSION"
+            exit 1
+          fi
+
+  test-all-versions:
+    name: Test on PHP ${{ matrix.php-version }}
+    runs-on: [self-hosted, linux, arm64, docker]
+    needs: validate-version
+    strategy:
+      matrix:
+        php-version: ['7.4', '8.0', '8.1', '8.2', '8.3']
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php-version }}
+          extensions: sockets, json, mbstring
+          coverage: none
+          tools: composer:v2
+      
+      - name: Install dependencies
+        run: composer install --prefer-dist --no-progress --no-interaction
+      
+      - name: Run tests
+        run: vendor/bin/phpunit --no-coverage
+      
+      - name: Validate examples
+        run: |
+          for example in examples/*.php; do
+            php -l "$example" || exit 1
+          done
+
+  build-release:
+    name: Build Release Package
+    runs-on: [self-hosted, linux, arm64, docker]
+    needs: [validate-version, test-all-versions]
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.2'
+          extensions: sockets, json, mbstring
+          tools: composer:v2
+      
+      - name: Update version in composer.json
+        run: |
+          VERSION="${{ needs.validate-version.outputs.version }}"
+          jq --arg ver "$VERSION" '.version = $ver' composer.json > composer.tmp
+          mv composer.tmp composer.json
+      
+      - name: Install production dependencies
+        run: composer install --prefer-dist --no-dev --no-progress --no-interaction --optimize-autoloader
+      
+      - name: Create release packages
+        run: |
+          VERSION="${{ needs.validate-version.outputs.version }}"
+          mkdir -p dist
+          
+          # Create tar.gz package
+          tar -czf "dist/logflux-agent-php-sdk-${VERSION}.tar.gz" \
+            --exclude=dist \
+            --exclude=tests \
+            --exclude=.github \
+            --exclude=Dockerfile \
+            --exclude=phpunit.xml.dist \
+            --exclude=.gitignore \
+            src/ vendor/ composer.json composer.lock README.md examples/
+          
+          # Create zip package
+          zip -r "dist/logflux-agent-php-sdk-${VERSION}.zip" \
+            src/ vendor/ composer.json composer.lock README.md examples/ \
+            -x "dist/*" "tests/*" ".github/*" "Dockerfile" "phpunit.xml.dist" ".gitignore"
+          
+          # Create checksums
+          cd dist
+          sha256sum *.tar.gz *.zip > checksums.txt
+      
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: release-packages
+          path: sdk/php/dist/*
+          retention-days: 7
+
+  publish-packagist:
+    name: Publish to Packagist
+    runs-on: [self-hosted, linux, arm64, docker]
+    needs: [validate-version, build-release]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.2'
+          tools: composer:v2
+      
+      - name: Update version in composer.json
+        run: |
+          VERSION="${{ needs.validate-version.outputs.version }}"
+          jq --arg ver "$VERSION" '.version = $ver' composer.json > composer.tmp
+          mv composer.tmp composer.json
+      
+      - name: Commit version update
+        run: |
+          git config --local user.email "actions@github.com"
+          git config --local user.name "GitHub Actions"
+          git add composer.json
+          git commit -m "Release PHP SDK v${{ needs.validate-version.outputs.version }}"
+      
+      - name: Tag release
+        run: |
+          VERSION="${{ needs.validate-version.outputs.version }}"
+          git tag -a "v${VERSION}" -m "Release PHP SDK v${VERSION}"
+      
+      # Note: Packagist webhook should be configured in repository settings
+      # or use API token if available
+      - name: Notify Packagist
+        env:
+          PACKAGIST_API_TOKEN: ${{ secrets.PACKAGIST_API_TOKEN }}
+        run: |
+          if [ -n "$PACKAGIST_API_TOKEN" ]; then
+            curl -X POST https://packagist.org/api/update-package?username=logflux \
+              -H "API-Token: $PACKAGIST_API_TOKEN" \
+              -d '{"repository":{"url":"https://github.com/logflux-io/logflux-agent"}}'
+          else
+            echo "Packagist webhook should handle the update"
+          fi
+
+  create-github-release:
+    name: Create GitHub Release
+    runs-on: [self-hosted, linux, arm64, docker]
+    needs: [validate-version, build-release]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Download release artifacts
+        uses: actions/download-artifact@v3
+        with:
+          name: release-packages
+          path: ./dist
+      
+      - name: Create release notes
+        run: |
+          VERSION="${{ needs.validate-version.outputs.version }}"
+          cat > release-notes.md << EOF
+          # LogFlux PHP SDK v${VERSION}
+          
+          ## Installation
+          
+          ### Composer
+          \`\`\`bash
+          composer require logflux/agent-php-sdk:^${VERSION}
+          \`\`\`
+          
+          ### Manual Installation
+          Download one of the packages below and extract to your project.
+          
+          ## Requirements
+          - PHP >= 7.4
+          - ext-sockets
+          - ext-json
+          
+          ## What's Changed
+          See commit history for detailed changes.
+          
+          ## Checksums
+          \`\`\`
+          $(cat dist/checksums.txt)
+          \`\`\`
+          EOF
+      
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: php-sdk-v${{ needs.validate-version.outputs.version }}
+          name: PHP SDK v${{ needs.validate-version.outputs.version }}
+          body_path: ./release-notes.md
+          files: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/checksums.txt
+          draft: false
+          prerelease: false
